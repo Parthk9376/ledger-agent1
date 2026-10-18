@@ -13,149 +13,193 @@ app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 
 DATA_URL = os.environ.get("LEDGER_DATA_URL", "").strip()
-TIMEOUT = 20
+TIMEOUT = 25
 MAX_PAGES = 100
 
-session = requests.Session()
-session.headers.update({"Accept": "application/json"})
+http = requests.Session()
+http.headers.update({"Accept": "application/json"})
 
 
 def norm(value):
     return re.sub(r"[^a-z0-9]", "", str(value).lower())
 
 
-def records_in(obj):
-    """Extract record lists from common JSON response structures."""
+def get_field(obj, aliases):
+    if not isinstance(obj, dict):
+        return None
+    wanted = {norm(x) for x in aliases}
+    for key, value in obj.items():
+        if norm(key) in wanted:
+            return value
+    return None
+
+
+def extract_records(obj):
+    """Find likely record arrays in common API responses."""
     if isinstance(obj, list):
         if obj and all(isinstance(x, dict) for x in obj):
             return obj
-
         result = []
         for item in obj:
-            result.extend(records_in(item))
+            result.extend(extract_records(item))
         return result
 
     if isinstance(obj, dict):
-        preferred = (
+        for key in (
             "records", "orders", "transactions", "ledger",
-            "items", "results", "rows", "data"
-        )
-
-        for key in preferred:
+            "items", "results", "rows"
+        ):
             value = obj.get(key)
             if isinstance(value, list):
                 if not value or all(isinstance(x, dict) for x in value):
                     return value
+                result = extract_records(value)
+                if result:
+                    return result
 
-                found = records_in(value)
-                if found:
-                    return found
-
-        for value in obj.values():
+        # A common API response is {"data": {"orders": [...]}}
+        for key in ("data", "result", "response"):
+            value = obj.get(key)
             if isinstance(value, (dict, list)):
-                found = records_in(value)
-                if found:
-                    return found
+                result = extract_records(value)
+                if result:
+                    return result
 
     return []
 
 
-def fetch_ledger():
+def fetch_records():
     if not DATA_URL:
         raise RuntimeError(
-            "Missing LEDGER_DATA_URL in Render Environment"
+            "LEDGER_DATA_URL is missing from Render Environment"
         )
 
     url = DATA_URL
     params = None
     visited = set()
-    records = []
+    all_records = []
 
     for _ in range(MAX_PAGES):
         if url in visited:
             break
-
         visited.add(url)
 
-        response = session.get(
-            url, params=params, timeout=TIMEOUT
-        )
+        response = http.get(url, params=params, timeout=TIMEOUT)
         response.raise_for_status()
-        payload = response.json()
-        params = None
 
-        page_records = records_in(payload)
-        records.extend(page_records)
+        try:
+            payload = response.json()
+        except ValueError:
+            raise RuntimeError(
+                "The ledger API did not return valid JSON"
+            )
+
+        all_records.extend(extract_records(payload))
+        params = None
 
         if not isinstance(payload, dict):
             break
 
-        # Explicit next-page links
+        # Follow explicit pagination links when provided.
         next_url = payload.get("next")
+        links = payload.get("links")
 
-        if not next_url:
-            links = payload.get("links")
-            if isinstance(links, dict):
-                next_url = links.get("next")
+        if not next_url and isinstance(links, dict):
+            next_url = links.get("next")
 
         if isinstance(next_url, str) and next_url:
             url = urljoin(response.url, next_url)
             continue
 
-        # Common pagination metadata
-        pagination = payload.get("pagination")
-        if not isinstance(pagination, dict):
-            pagination = payload.get("meta", {})
+        # Support common page-number metadata.
+        meta = payload.get("pagination")
+        if not isinstance(meta, dict):
+            meta = payload.get("meta", {})
 
-        if isinstance(pagination, dict):
-            current = pagination.get(
-                "page", pagination.get("current_page")
-            )
-            last = pagination.get(
-                "total_pages", pagination.get("last_page")
-            )
+        if isinstance(meta, dict):
+            current = meta.get("page", meta.get("current_page"))
+            last = meta.get("total_pages", meta.get("last_page"))
 
             if current is not None and last is not None:
-                if int(current) < int(last):
-                    params = {"page": int(current) + 1}
-                    url = DATA_URL
-                    continue
+                try:
+                    if int(current) < int(last):
+                        url = DATA_URL
+                        params = {"page": int(current) + 1}
+                        continue
+                except (TypeError, ValueError):
+                    pass
 
         break
 
-    # Deduplicate identical records
+    # Remove exact duplicate records.
     unique = {}
-    for record in records:
-        key = json.dumps(
-            record, sort_keys=True, default=str
-        )
-        unique[key] = record
+    for row in all_records:
+        key = json.dumps(row, sort_keys=True, default=str)
+        unique[key] = row
 
-    if not unique:
+    records = list(unique.values())
+
+    if not records:
         raise RuntimeError(
-            "The API returned no ledger records. "
-            "Check the upstream response and pagination."
+            "No ledger records found; inspect the API response schema"
         )
 
-    return list(unique.values())
+    app.logger.info("Loaded %d ledger records", len(records))
+    return records
 
 
-def field(record, aliases):
-    """Find a field by normalized name."""
-    wanted = {norm(alias) for alias in aliases}
+REGION_FIELDS = [
+    "region", "sales_region", "territory", "sales_territory"
+]
+DATE_FIELDS = [
+    "order_date", "date", "created_at",
+    "transaction_date", "purchase_date", "timestamp"
+]
+STATUS_FIELDS = [
+    "payment_status", "financial_status",
+    "payment_state", "status"
+]
+CUSTOMER_FIELDS = [
+    "customer_id", "customerId", "customer_email",
+    "buyer_id", "customer_name", "customer"
+]
+AMOUNT_FIELDS = [
+    "order_value_usd", "paid_amount_usd",
+    "total_amount_usd", "amount_usd", "order_total",
+    "order_value", "total_amount", "grand_total",
+    "total", "amount", "net_amount", "revenue", "sales"
+]
+PRODUCT_FIELDS = [
+    "product_name", "product", "item_name",
+    "title", "sku", "description"
+]
 
-    for key, value in record.items():
-        if norm(key) in wanted:
-            return value
+
+def parse_date(value):
+    if value is None:
+        return None
+
+    text = str(value).strip()
+
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        pass
+
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%d-%m-%Y",
+                "%m/%d/%Y", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return datetime.strptime(text, fmt)
+        except ValueError:
+            continue
 
     return None
 
 
-def number(value):
+def parse_number(value):
     if value is None or isinstance(value, bool):
         return None
-
-    if isinstance(value, (int, float)):
+    if isinstance(value, (float, int)):
         return float(value)
 
     text = str(value).strip()
@@ -164,7 +208,7 @@ def number(value):
 
     negative = text.startswith("(") and text.endswith(")")
     text = text.replace(",", "")
-    text = re.sub(r"[$₹€£]", "", text)
+    text = re.sub(r"[$£€₹]", "", text)
     text = re.sub(r"\bUSD\b", "", text, flags=re.I)
     text = text.strip(" ()")
 
@@ -175,193 +219,162 @@ def number(value):
         return None
 
 
-def parse_date(value):
+def is_paid(row):
+    status = get_field(row, STATUS_FIELDS)
+    if status is None:
+        return False
+
+    return norm(status) in {
+        "paid", "settled", "completed", "succeeded"
+    }
+
+
+def find_customer(row):
+    value = get_field(row, CUSTOMER_FIELDS)
+
+    if isinstance(value, dict):
+        value = get_field(
+            value, ["id", "customer_id", "email", "name"]
+        )
+
+    if value is None:
+        nested = row.get("customer")
+        if isinstance(nested, dict):
+            value = get_field(nested, ["id", "customer_id", "email"])
+
     if value is None:
         return None
 
-    if isinstance(value, (int, float)):
-        try:
-            return datetime.fromtimestamp(value)
-        except (ValueError, OSError, OverflowError):
-            return None
+    value = str(value).strip().lower()
+    return value or None
 
-    text = str(value).strip()
 
-    try:
-        return datetime.fromisoformat(
-            text.replace("Z", "+00:00")
-        )
-    except ValueError:
-        pass
+def product_matches(row, product_name):
+    """Match a requested product against product/item records."""
+    target = norm(product_name)
 
-    for fmt in (
-        "%Y-%m-%d",
-        "%Y/%m/%d",
-        "%d-%m-%Y",
-        "%m/%d/%Y",
-        "%Y-%m-%d %H:%M:%S",
-        "%B %d, %Y"
-    ):
-        try:
-            return datetime.strptime(text, fmt)
-        except ValueError:
+    # Check top-level product fields.
+    value = get_field(row, PRODUCT_FIELDS)
+    if value is not None and target in norm(value):
+        return True
+
+    # Check line-item arrays, without matching customer names.
+    for key in ("items", "line_items", "products", "order_items"):
+        items = row.get(key)
+        if isinstance(items, dict):
+            items = [items]
+
+        if not isinstance(items, list):
             continue
 
-    return None
+        for item in items:
+            if isinstance(item, dict):
+                name = get_field(item, PRODUCT_FIELDS)
+                if name is not None and target in norm(name):
+                    return True
+            elif isinstance(item, str) and target in norm(item):
+                return True
+
+    return False
 
 
-REGION_FIELDS = (
-    "region", "sales_region", "territory",
-    "sales_territory", "customer_region"
-)
-
-DATE_FIELDS = (
-    "order_date", "date", "created_at",
-    "transaction_date", "purchase_date",
-    "paid_at", "timestamp"
-)
-
-AMOUNT_FIELDS = (
-    "order_value_usd", "paid_amount_usd",
-    "total_amount_usd", "amount_usd",
-    "order_total", "order_value", "total_amount",
-    "total", "amount", "sales", "revenue",
-    "net_amount", "grand_total", "value"
-)
-
-STATUS_FIELDS = (
-    "payment_status", "status", "order_status",
-    "payment_state", "financial_status"
-)
-
-CURRENCY_FIELDS = ("currency", "currency_code")
-
-
-def month_year(question):
+def requested_product(question):
+    # Prefer a known product name appearing in the question.
     match = re.search(
-        r"\b(january|february|march|april|may|june|"
-        r"july|august|september|october|november|december)"
-        r"\s+(20\d{2})\b",
-        question.lower()
+        r"\b(toaster|kettle|blender|microwave|refrigerator|"
+        r"washer|oven|air conditioner)\b",
+        question,
+        flags=re.I
     )
+    if match:
+        return match.group(1)
 
-    if not match:
-        return None, None
-
-    month = datetime.strptime(match.group(1), "%B").month
-    return month, int(match.group(2))
+    match = re.search(
+        r"\b(?:bought|purchased|buy)\s+(?:a|an|the)\s+"
+        r"([a-z0-9 -]+?)(?:\s*\(|\s+in\s+|\s+from\s+|\?|$)",
+        question,
+        flags=re.I
+    )
+    return match.group(1).strip() if match else None
 
 
 def answer_question(question, records):
     q = question.lower()
 
-    # Determine requested region
+    # Customer-count questions.
+    if any(phrase in q for phrase in (
+        "distinct customer", "unique customer",
+        "how many customers"
+    )):
+        product = requested_product(q)
+        if not product:
+            raise ValueError("Could not identify the requested product")
+
+        customers = set()
+
+        for row in records:
+            if not is_paid(row):
+                continue
+            if not product_matches(row, product):
+                continue
+
+            customer = find_customer(row)
+            if customer:
+                customers.add(customer)
+
+        return str(len(customers))
+
+    # Region filter.
     region_match = re.search(
         r"\b(north|south|east|west|central)\b", q
     )
     region = region_match.group(1) if region_match else None
 
-    month, year = month_year(q)
+    # Optional month/year filter.
+    month_match = re.search(
+        r"\b(january|february|march|april|may|june|july|"
+        r"august|september|october|november|december)\s+(20\d{2})\b",
+        q
+    )
+    month = year = None
 
-    # Select the metric
-    is_average = bool(
-        re.search(r"\b(average|avg|mean)\b", q)
-    )
-    asks_refund = "refund" in q
-    asks_product = "product" in q
-    asks_customer = "customer" in q
-    asks_paid = bool(
-        re.search(r"\b(paid|payment|settled)\b", q)
-    )
+    if month_match:
+        month = datetime.strptime(
+            month_match.group(1), "%B"
+        ).month
+        year = int(month_match.group(2))
 
-    # Determine available fields from the actual data
-    sample = records[0]
+    average = bool(re.search(r"\b(average|avg|mean)\b", q))
+    paid_only = bool(re.search(r"\b(paid|settled)\b", q))
 
-    region_key = next(
-        (k for k in sample if norm(k) in
-         {norm(x) for x in REGION_FIELDS}), None
-    )
-    date_key = next(
-        (k for k in sample if norm(k) in
-         {norm(x) for x in DATE_FIELDS}), None
-    )
-    amount_key = next(
-        (k for k in sample if norm(k) in
-         {norm(x) for x in AMOUNT_FIELDS}), None
-    )
-    status_key = next(
-        (k for k in sample if norm(k) in
-         {norm(x) for x in STATUS_FIELDS}), None
-    )
-    currency_key = next(
-        (k for k in sample if norm(k) in
-         {norm(x) for x in CURRENCY_FIELDS}), None
-    )
-
-    if not amount_key:
-        raise ValueError(
-            "Amount field not recognized. "
-            "Inspect the actual ledger JSON schema."
-        )
-
-    selected = []
+    amounts = []
 
     for row in records:
         if region:
-            value = field(row, REGION_FIELDS)
+            value = get_field(row, REGION_FIELDS)
             if value is None or str(value).strip().lower() != region:
                 continue
 
-        if month is not None and year is not None:
-            date_value = field(row, DATE_FIELDS)
-            dt = parse_date(date_value)
-
-            if dt is None or dt.year != year or dt.month != month:
+        if month is not None:
+            dt = parse_date(get_field(row, DATE_FIELDS))
+            if dt is None or dt.month != month or dt.year != year:
                 continue
 
-        if asks_paid:
-            status = field(row, STATUS_FIELDS)
-            if status is None:
-                raise ValueError(
-                    "Paid-order question requires a status field."
-                )
+        if paid_only and not is_paid(row):
+            continue
 
-            if norm(status) not in {
-                "paid", "settled", "completed", "succeeded"
-            }:
-                continue
-
-        if asks_refund:
-            refund_value = field(
-                row, ("refund_amount", "refunded_amount", "refund")
-            )
-            if refund_value is None:
-                continue
-
-            amount = number(refund_value)
-        else:
-            amount = number(field(row, AMOUNT_FIELDS))
-
+        amount = parse_number(get_field(row, AMOUNT_FIELDS))
         if amount is None:
             continue
 
-        if currency_key:
-            currency = str(row.get(currency_key, "")).upper()
-            if "USD" in q and currency not in ("USD", "US$", "$"):
-                continue
+        amounts.append(amount)
 
-        selected.append(amount)
-
-    if not selected:
+    if not amounts:
         raise ValueError(
-            "No matching records found for the requested question."
+            "No matching monetary records. Check actual ledger fields."
         )
 
-    if is_average:
-        result = sum(selected) / len(selected)
-    else:
-        result = sum(selected)
-
+    result = sum(amounts) / len(amounts) if average else sum(amounts)
     return f"{result:.2f}"
 
 
@@ -383,23 +396,28 @@ def answer():
         return jsonify({"error": "Missing question"}), 400
 
     try:
-        records = fetch_ledger()
+        records = fetch_records()
         result = answer_question(question, records)
         return jsonify({"answer": result})
 
     except requests.HTTPError as exc:
         status = exc.response.status_code if exc.response else 502
-        app.logger.exception("Upstream ledger HTTP error")
+        app.logger.exception("Ledger API request failed")
         return jsonify({
-            "error": "Ledger data request failed",
+            "error": "Ledger API request failed",
             "upstream_status": status
         }), 502
 
-    except Exception as exc:
-        app.logger.exception("Ledger processing failed")
+    except requests.RequestException:
+        app.logger.exception("Ledger network request failed")
         return jsonify({
-            "error": str(exc),
-            "type": type(exc).__name__
+            "error": "Could not connect to the ledger API"
+        }), 502
+
+    except Exception:
+        app.logger.exception("Ledger answer processing failed")
+        return jsonify({
+            "error": "Ledger processing failed; check Render logs"
         }), 500
 
 
